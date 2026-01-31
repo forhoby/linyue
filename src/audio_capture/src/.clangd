@@ -1,0 +1,16 @@
+CompileFlags:
+  Add:
+    - -std=c++11
+    - -pthread
+    - -I/usr/include/c++/11
+    - -I/usr/include/aarch64-linux-gnu/c++/11
+    - -I/usr/include
+    - -I/usr/include/aarch64-linux-gnu
+
+Clangd:
+  Arguments:
+    - --query-driver=/usr/bin/c++
+    - --include-directory=/usr/include/c++/11
+    - --include-directory=/usr/include/aarch64-linux-gnu/c++/11
+    - --include-directory=/usr/include
+    - --include-directory=/usr/include/aarch64-linux-gnu

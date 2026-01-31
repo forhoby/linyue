@@ -1,0 +1,309 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <termios.h>
+#include <errno.h>
+#include <thread>
+#include <chrono>
+
+// ROS2 头文件
+#include "rclcpp/rclcpp.hpp"
+#include "geometry_msgs/msg/vector3.hpp"
+
+#define SERIAL_PORT "/dev/ttyS7"
+#define BAUDRATE B115200
+
+// 协议相关定义
+#define MSG_START_BYTE0 0xEE
+#define MSG_START_BYTE1 0xEF
+#define MSG_END_BYTE 0xFF
+
+// 状态机状态
+typedef enum {
+    STATE_WAIT_START0,
+    STATE_WAIT_START1,
+    STATE_WAIT_TYPE,
+    STATE_WAIT_LENGTH,
+    STATE_WAIT_DATA,
+    STATE_WAIT_CHECKSUM,
+    STATE_WAIT_END
+} ParserState;
+
+// 解析器结构体
+typedef struct {
+    ParserState state;
+    unsigned char buffer[256];
+    int buffer_pos;
+    int data_length;
+    unsigned char message_type;
+} ProtocolParser;
+
+// 小端序字节转单精度浮点数
+float bytes_to_float_little_endian(unsigned char byte0, unsigned char byte1, unsigned char byte2, unsigned char byte3) {
+    // 构建小端序浮点数
+    union {
+        unsigned char bytes[4];
+        float value;
+    } conversion;
+    
+    conversion.bytes[0] = byte0;
+    conversion.bytes[1] = byte1;
+    conversion.bytes[2] = byte2;
+    conversion.bytes[3] = byte3;
+    
+    return conversion.value;
+}
+
+// 初始化解析器
+void init_parser(ProtocolParser *parser) {
+    parser->state = STATE_WAIT_START0;
+    parser->buffer_pos = 0;
+    parser->data_length = 0;
+    parser->message_type = 0;
+}
+
+// 处理单个字节
+int process_byte(ProtocolParser *parser, unsigned char byte) {
+    switch (parser->state) {
+        case STATE_WAIT_START0:
+            if (byte == MSG_START_BYTE0) {
+                parser->buffer[parser->buffer_pos++] = byte;
+                parser->state = STATE_WAIT_START1;
+            }
+            break;
+            
+        case STATE_WAIT_START1:
+            if (byte == MSG_START_BYTE1) {
+                parser->buffer[parser->buffer_pos++] = byte;
+                parser->state = STATE_WAIT_TYPE;
+            } else {
+                init_parser(parser); // 重置
+            }
+            break;
+            
+        case STATE_WAIT_TYPE:
+            parser->message_type = byte;
+            parser->buffer[parser->buffer_pos++] = byte;
+            parser->state = STATE_WAIT_LENGTH;
+            break;
+            
+        case STATE_WAIT_LENGTH:
+            parser->data_length = byte;
+            parser->buffer[parser->buffer_pos++] = byte;
+            if (parser->data_length > 0) {
+                parser->state = STATE_WAIT_DATA;
+            } else {
+                parser->state = STATE_WAIT_CHECKSUM;
+            }
+            break;
+            
+        case STATE_WAIT_DATA:
+            parser->buffer[parser->buffer_pos++] = byte;
+            if (parser->buffer_pos - 4 >= parser->data_length) { // 4是前面的起始字节、类型和长度
+                parser->state = STATE_WAIT_CHECKSUM;
+            }
+            break;
+            
+        case STATE_WAIT_CHECKSUM:
+            parser->buffer[parser->buffer_pos++] = byte;
+            parser->state = STATE_WAIT_END;
+            break;
+            
+        case STATE_WAIT_END:
+            if (byte == MSG_END_BYTE) {
+                parser->buffer[parser->buffer_pos++] = byte;
+                // 解析完成
+                return 1;
+            } else {
+                init_parser(parser); // 重置
+            }
+            break;
+    }
+    return 0;
+}
+
+// 方位角节点类
+class AzimuthNode : public rclcpp::Node {
+public:
+    AzimuthNode() : Node("azimuth_node") {
+        // 创建发布者，发布方位角数据
+        publisher_ = this->create_publisher<geometry_msgs::msg::Vector3>("azimuth_angle", 10);
+        
+        // 初始化串口
+        if (init_serial() != 0) {
+            RCLCPP_ERROR(this->get_logger(), "无法初始化串口");
+            return;
+        }
+        
+        // 初始化解析器
+        init_parser(&parser_);
+        
+        // 启动串口读取线程
+        serial_thread_ = std::thread(&AzimuthNode::serial_read_thread, this);
+        
+        RCLCPP_INFO(this->get_logger(), "方位角节点启动成功");
+    }
+    
+    ~AzimuthNode() {
+        if (serial_thread_.joinable()) {
+            serial_thread_.join();
+        }
+        if (fd_ >= 0) {
+            close(fd_);
+        }
+    }
+    
+private:
+    // 初始化串口
+    int init_serial() {
+        // 打开串口
+        fd_ = open(SERIAL_PORT, O_RDWR | O_NOCTTY);
+        if (fd_ == -1) {
+            RCLCPP_ERROR(this->get_logger(), "无法打开串口: %s", strerror(errno));
+            return -1;
+        }
+        
+        // 获取当前串口配置
+        struct termios options;
+        if (tcgetattr(fd_, &options) != 0) {
+            RCLCPP_ERROR(this->get_logger(), "无法获取串口配置: %s", strerror(errno));
+            close(fd_);
+            fd_ = -1;
+            return -1;
+        }
+        
+        // 设置波特率
+        cfsetispeed(&options, BAUDRATE);
+        cfsetospeed(&options, BAUDRATE);
+        
+        // 设置数据位: 8位
+        options.c_cflag &= ~CSIZE;
+        options.c_cflag |= CS8;
+        
+        // 设置奇偶校验: 无
+        options.c_cflag &= ~PARENB;
+        
+        // 设置停止位: 1位
+        options.c_cflag &= ~CSTOPB;
+        
+        // 禁用硬件流控制
+        options.c_cflag &= ~CRTSCTS;
+        
+        // 启用接收器，设置本地模式
+        options.c_cflag |= CREAD | CLOCAL;
+        
+        // 禁用软件流控制
+        options.c_iflag &= ~(IXON | IXOFF | IXANY);
+        
+        // 设置原始输入模式
+        options.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
+        
+        // 设置读取超时
+        options.c_cc[VMIN] = 0;    // 最小读取字符数
+        options.c_cc[VTIME] = 50;   // 超时时间（单位：0.1秒）
+        
+        // 应用配置
+        if (tcsetattr(fd_, TCSANOW, &options) != 0) {
+            RCLCPP_ERROR(this->get_logger(), "无法设置串口配置: %s", strerror(errno));
+            close(fd_);
+            fd_ = -1;
+            return -1;
+        }
+        
+        RCLCPP_INFO(this->get_logger(), "串口初始化成功: %s, 波特率: %d", SERIAL_PORT, BAUDRATE);
+        return 0;
+    }
+    
+    // 串口读取线程
+    void serial_read_thread() {
+        unsigned char buffer[256];
+        
+        while (rclcpp::ok() && fd_ >= 0) {
+            // 设置读取超时（使用select实现）
+            struct timeval timeout;
+            timeout.tv_sec = 1;  // 1秒超时
+            timeout.tv_usec = 0;
+            
+            fd_set read_fds;
+            FD_ZERO(&read_fds);
+            FD_SET(fd_, &read_fds);
+            
+            int select_result = select(fd_ + 1, &read_fds, NULL, NULL, &timeout);
+            
+            if (select_result > 0) {
+                if (FD_ISSET(fd_, &read_fds)) {
+                    // 有数据可读，尝试读取
+                    int n = read(fd_, buffer, sizeof(buffer));
+                    if (n > 0) {
+                        // 处理每个字节
+                        for (int i = 0; i < n; i++) {
+                            if (process_byte(&parser_, buffer[i])) {
+                                // 解析成功，处理数据
+                                RCLCPP_INFO(this->get_logger(), "解析成功: %d 字节", parser_.buffer_pos);
+                                RCLCPP_INFO(this->get_logger(), "消息类型: 0x%02X", parser_.message_type);
+                                RCLCPP_INFO(this->get_logger(), "数据长度: %d", parser_.data_length);
+                                
+                                // 解析方位角数据（从第4字节开始，跳过起始字节、类型和长度）
+                                if (parser_.data_length >= 4) {
+                                    publish_azimuth(&parser_.buffer[4], parser_.data_length);
+                                }
+                                
+                                // 重置解析器
+                                init_parser(&parser_);
+                            }
+                        }
+                    } else if (n < 0) {
+                        if (!(errno == EAGAIN || errno == EWOULDBLOCK)) {
+                            RCLCPP_ERROR(this->get_logger(), "读取数据失败: %s", strerror(errno));
+                        }
+                    }
+                }
+            } else if (select_result < 0) {
+                RCLCPP_ERROR(this->get_logger(), "select失败: %s", strerror(errno));
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
+    }
+    
+    // 发布方位角数据
+    void publish_azimuth(unsigned char *data, int length) {
+        if (length >= 4) {
+            float azimuth = bytes_to_float_little_endian(data[0], data[1], data[2], data[3]);
+            
+            // 创建消息
+            auto message = geometry_msgs::msg::Vector3();
+            message.x = azimuth;  // 方位角
+            message.y = 0.0;      // 预留
+            message.z = 0.0;      // 预留
+            
+            // 发布消息
+            publisher_->publish(message);
+            
+            RCLCPP_INFO(this->get_logger(), "发布方位角: %.6f", azimuth);
+        }
+    }
+    
+    // 成员变量
+    rclcpp::Publisher<geometry_msgs::msg::Vector3>::SharedPtr publisher_;
+    int fd_ = -1;
+    ProtocolParser parser_;
+    std::thread serial_thread_;
+};
+
+int main(int argc, char *argv[]) {
+    // 初始化ROS2
+    rclcpp::init(argc, argv);
+    
+    // 创建节点
+    auto node = std::make_shared<AzimuthNode>();
+    
+    // 运行节点
+    rclcpp::spin(node);
+    
+    // 关闭ROS2
+    rclcpp::shutdown();
+    
+    return 0;
+}

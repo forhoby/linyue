@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from std_msgs.msg import UInt8MultiArray, Int16MultiArray, String
+from audio_capture.msg import AudioData
+from cv_bridge import CvBridge
+import cv2
+import numpy as np
+
+import os
+import sys
+import base64
+import time
+import dashscope
+from dashscope.audio.qwen_omni import *
+
+def KEY():
+    return 'sk-0f2efe013a83483ab1cde34ba725bdba'
+
+class ROSOmniCallback(OmniRealtimeCallback):
+    """
+    重写回调类，将大模型返回的数据桥接到 ROS Publisher
+    """
+    def __init__(self, node_instance):
+        self.node = node_instance
+
+    def on_open(self) -> None:
+        self.node.get_logger().info('✅ DashScope Connection opened!')
+
+    def on_close(self, close_status_code, close_msg) -> None:
+        self.node.get_logger().warn(f'⚠️ DashScope Connection closed: {close_msg}')
+        # 更新连接状态为已关闭
+        self.node.omni_connected = False
+
+    def on_event(self, response: str) -> None:
+        try:
+            event_type = response.get('type','unknown')
+            print(f">>>[DEBUG] Recieved Event:{event_type}", flush=True) # 减少刷屏，仅打印类型
+
+            if event_type=='error':
+                self.node.get_logger().error(f"SERVER ERROR:{response}")
+                # 遇到错误时，更新连接状态为已关闭
+                self.node.omni_connected = False
+            
+            # 1. 处理语音回复 (最关键的部分)
+            if 'response.audio.delta' == event_type:
+                recv_audio_b64 = response['delta']
+                # 解码 Base64 -> Bytes
+                audio_bytes = base64.b64decode(recv_audio_b64)
+                # Bytes -> Numpy Int16
+                audio_np = np.frombuffer(audio_bytes, dtype=np.int16)
+                
+                # 发布到 /robot/audio_reply
+                msg = Int16MultiArray()
+                msg.data = audio_np.tolist()
+                self.node.pub_audio_reply.publish(msg)
+
+            # 2. 打印文本回复 (调试用)
+            elif 'response.audio_transcript.delta' == event_type:
+                text = response['delta']
+                self.node.get_logger().info(f"AI: {text}") 
+
+            # 3. 识别用户说的话
+            elif 'conversation.item.input_audio_transcription.completed' == event_type:
+                self.node.get_logger().info(f"🗣️ User said: {response['transcript']}")
+                # 重置音频发送状态
+                self.node.audio_sent = False
+                self.node.get_logger().info(f"🗣️重置图片发送")
+               
+            
+            # 4. 打断信号 (VAD检测到用户说话)
+            elif 'input_audio_buffer.speech_started' == event_type:
+                self.node.get_logger().info('🛑 User Speech Started (Interrupt)')
+                # 这里可以发布一个空消息或者特定指令给播放节点，让它立即停止播放
+                # self.node.pub_interrupt.publish(...) 
+
+        except Exception as e:
+            self.node.get_logger().error(f'Callback Error: {e}')
+
+
+class OmniBrainNode(Node):
+    def __init__(self):
+        super().__init__('omni_brain_node')
+
+        # --- 配置 ---
+        # 建议优先使用环境变量 export DASHSCOPE_API_KEY="sk-..."
+        if 'DASHSCOPE_API_KEY' not in os.environ:
+             # TODO: 请在这里填入你的真实 API KEY
+             dashscope.api_key = KEY()
+             self.get_logger().warn("Using hardcoded API Key. Please verify it is correct.")
+        else:
+             dashscope.api_key = os.environ['DASHSCOPE_API_KEY']
+        
+        self.voice = 'Chelsie'
+
+        # --- 1. 初始化工具 ---
+        self.bridge = CvBridge()
+        self.last_video_send_time = 0.0
+        self.video_interval = 0.5  # 视频发送频率 (秒)
+        
+        # [关键配置] 音频分片大小
+        # 16000Hz * 16bit(2bytes) = 32000 bytes/sec
+        # 60ms = 0.06 * 32000 = 1920 bytes
+        # 这个大小既能保证低延迟，又绝对安全不会导致 WebSocket 包体过大
+        self.AUDIO_CHUNK_SIZE = 1920 
+        
+        # 连接状态标志
+        self.omni_connected = False
+        
+        # 音频发送状态标志
+        self.audio_sent = False
+        
+        # 图像缓冲区，用于保存最近的一个 image 消息
+        self.image_buffer = None
+
+        # --- 2. 订阅话题 ---
+        # [视觉] 订阅摄像头
+        self.sub_img = self.create_subscription(
+            Image, 
+            '/camera/image', 
+            self.image_callback, 
+            10
+        )
+        
+        # [听觉] 订阅麦克风数据 (AudioData)
+        # ⚠️ 必须确保上游发布的数据格式为:
+        self.sub_audio = self.create_subscription(
+            AudioData, 
+            'voice_data', 
+            self.audio_input_callback, 
+            10
+        )
+
+        # --- 3. 发布话题 ---
+        # [表达] 发送音频给扬声器节点
+        self.pub_audio_reply = self.create_publisher(
+            Int16MultiArray, 
+            '/robot/audio_reply', 
+            10
+        )
+        
+        # --- 4. 初始化阿里云 Omni 连接 ---
+        self.init_omni_connection()
+        
+        self.get_logger().info("✅ Omni Brain Node Started! Waiting for /audio/audio_data...")
+
+    def init_omni_connection(self):
+        try:
+            callback = ROSOmniCallback(self)
+            
+            self.conversation = OmniRealtimeConversation(
+                model='qwen-omni-turbo-realtime-latest',
+                callback=callback, 
+            )
+
+            # 连接到 DashScope
+            self.get_logger().info("Attempting to connect to DashScope...")
+            connect_result = self.conversation.connect()
+            self.get_logger().info(f"Connect() returned: {connect_result}")
+            
+            # 检查连接状态
+            connection_status = getattr(self.conversation, 'connected', None)
+            if connection_status is None:
+                self.get_logger().warn("Connection status attribute not found, using alternative check")
+                # 由于无法直接获取连接状态，我们假设连接成功，后续会通过错误处理来更新状态
+                self.omni_connected = True
+            elif connection_status:
+                self.get_logger().info("✅ WebSocket connection established successfully")
+                self.omni_connected = True
+            else:
+                self.get_logger().error("❌ WebSocket connection failed")
+                self.omni_connected = False
+            
+            # 等待连接完全建立
+            self.get_logger().info("Waiting for connection to fully establish...")
+            time.sleep(2.0)
+            self.get_logger().info("Connection setup completed")
+            # 配置 Session 参数
+            self.conversation.update_session(
+                output_modalities=[MultiModality.AUDIO, MultiModality.TEXT],
+                voice=self.voice,
+                input_audio_format=AudioFormat.PCM_16000HZ_MONO_16BIT,
+                output_audio_format=AudioFormat.PCM_16000HZ_MONO_16BIT,
+                enable_input_audio_transcription=True,
+                input_audio_transcription_model='gummy-realtime-v1',
+                enable_turn_detection=True,
+                turn_detection_type='server_vad',
+                instructions="你是一个真实的人类，请感受用户的声音和语气以及画面中他的脸以感受他的情绪，然后根据他的情绪和语气和他交流"
+            )
+            self.get_logger().info("DashScope Session Initialized.")
+            
+        except Exception as e:
+            self.get_logger().error(f"Failed to connect to DashScope: {e}")
+            self.omni_connected = False
+            # sys.exit(1) # 建议不要直接退出，可能网络波动，保留节点等待重连逻辑(如需)
+
+    def audio_input_callback(self, msg: AudioData):
+        """
+        [修改版] 接收来自麦克风节点的原始音频数据，切片后转发给大模型
+        解决包体过大导致 Connection Closed 的问题
+        """
+        try:
+            # 检查连接状态
+            if not self.omni_connected:
+                self.get_logger().warn("Omni connection not established, skipping audio send. Attempting to reconnect...")
+                self.init_omni_connection()
+                return
+
+            # 1. 获取原始字节流
+            audio_bytes = bytes(msg.data)
+            total_len = len(audio_bytes)
+
+            # 如果数据为空，直接跳过
+            if total_len == 0:
+                return
+
+            # 检查是否是首次发送音频
+            is_first_audio = not self.audio_sent
+            
+            # 标记音频已发送（即使还没发送完，先标记为已发送，确保后续逻辑正确）
+            if is_first_audio:
+                self.audio_sent = True
+                self.get_logger().info("✅ Audio send initialized")
+
+            # 2. 循环切片发送音频
+            # 步长为 self.AUDIO_CHUNK_SIZE (1920 bytes / 60ms)
+            for i in range(0, total_len, self.AUDIO_CHUNK_SIZE):
+                
+                # 获取当前切片
+                chunk = audio_bytes[i : i + self.AUDIO_CHUNK_SIZE]
+                
+                # 转 Base64
+                # 因为 chunk 很小，这里的 Base64 字符串也很短，非常安全
+                audio_b64 = base64.b64encode(chunk).decode('ascii')
+                
+                # 发送给 DashScope
+                try:
+                    self.conversation.append_audio(audio_b64)
+                    
+                    # [重要流控] 
+                    # 稍微 sleep 一下，模拟实时流的速度，防止瞬间将大块数据塞入 WebSocket 导致拥塞
+                    # 0.005s = 5ms，对于 60ms 的音频片来说，发送速度依然远快于播放速度，不会卡顿
+                    time.sleep(0.005)
+                except Exception as append_error:
+                    self.get_logger().error(f"Audio Input Error: {append_error}")
+                    # 如果是连接关闭错误，更新连接状态
+                    if "Connection is already closed" in str(append_error):
+                        self.omni_connected = False
+                        self.get_logger().warn("Connection closed, will attempt to reconnect on next audio input")
+                    break
+
+            # 首次发送音频完成后，检查是否有图像缓冲区
+            if is_first_audio and self.image_buffer is not None:
+                try:
+                    # 处理并发送图像
+                    cv_image = self.bridge.imgmsg_to_cv2(self.image_buffer, desired_encoding='bgr8')
+                    
+                    # 压缩图片: 缩放到 640 宽 + JPEG 质量 40
+                    height, width = cv_image.shape[:2]
+                    new_width = 640
+                    new_height = int(new_width * height / width)
+                    cv_image_resized = cv2.resize(cv_image, (new_width, new_height))
+                    
+                    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 40]
+
+                    result, buffer = cv2.imencode('.jpg', cv_image_resized, encode_param)
+                    
+                    if result:
+                        img_b64 = base64.b64encode(buffer).decode('ascii')
+                        
+                        # 发送给 DashScope
+                        self.conversation.append_video(img_b64)
+                        
+                        # 计算一下大小，方便观察
+                        size_kb = len(img_b64) / 1024.0
+                        self.get_logger().info(f"Sent buffered video frame ({size_kb:.1f}KB)")
+                except Exception as img_error:
+                    self.get_logger().error(f"Image Send Error: {img_error}")
+
+            # 调试日志：如果觉得太刷屏，可以注释掉
+                #self.get_logger().info(f"Sent audio batch: {total_len} bytes")
+            
+        except Exception as e:
+            self.get_logger().error(f"Audio Input Error: {e}")
+            # 如果是连接关闭错误，更新连接状态
+            if "Connection is already closed" in str(e):
+                self.omni_connected = False
+                self.get_logger().warn("Connection closed, will attempt to reconnect on next audio input")
+        
+
+    def image_callback(self, msg: Image):
+        """
+        接收摄像头图像，保存到缓冲区
+        """
+        try:
+            # 将 ROS Image 消息保存到缓冲区，不直接发送
+            # 这样可以确保我们总是有最新的图像，并且只在发送音频时才发送图像
+            self.image_buffer = msg
+            # 调试日志
+            # self.get_logger().info(f"Updated image buffer")
+            
+        except Exception as e:
+            self.get_logger().error(f"Image Buffer Error: {e}")
+
+    def destroy_node(self):
+        if hasattr(self, 'conversation'):
+            self.conversation.close()
+        super().destroy_node()
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = OmniBrainNode()
+    
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
