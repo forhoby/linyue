@@ -1,0 +1,278 @@
+#include <fcntl.h>
+#include <termios.h>
+#include <unistd.h>
+#include <cstring>
+#include <cstdint>
+#include <iostream>
+#include <thread>
+#include <chrono>
+#include <errno.h>
+
+// ROS2 头文件
+#include "rclcpp/rclcpp.hpp"
+#include "std_msgs/msg/float64_multi_array.hpp"
+
+#define FRAME_HEADER 0x55
+#define CMD_SERVO_MOVE 0x03
+#define GET_LOW_BYTE(A) ((uint8_t)(A))
+#define GET_HIGH_BYTE(A) ((uint8_t)((A) >> 8))
+#define baud_rate B9600
+
+// 舵机参数
+#define SERVO_RIGHT_EYE_YAW 3     // 右眼左右转动舵机ID
+#define SERVO_LEFT_EYE_YAW 4      // 左眼左右转动舵机ID
+#define SERVO_BOTH_EYES_PITCH 5   // 双眼上下转动舵机ID
+#define SERVO_MIN_POS 500         // 舵机最小位置
+#define SERVO_MAX_POS 2500        // 舵机最大位置
+#define SERVO_YAW_CENTER 1500     // 左右转动中心位置
+#define SERVO_PITCH_CENTER 1700   // 上下转动中心位置
+#define SERVO_YAW_LIMIT 300       // 左右转动限位（中心位置±300）
+#define SERVO_PITCH_LIMIT 300     // 上下转动限位（中心位置±300）
+#define ANGLE_RANGE 60.0          // 角度范围（度）
+#define MOVE_TIME 400             // 舵机移动时间（毫秒）
+
+class ServoController {
+private:
+    int uart_fd_;
+    std::string uart_device_;
+    
+    uint8_t tx_buf_[128];
+
+public:
+    ServoController(const std::string& device) : uart_fd_(-1), uart_device_(device) {
+        if (!init_uart()) {
+            std::cerr << "Failed to initialize UART" << std::endl;
+        }
+    }
+    
+    ~ServoController() {
+        if (uart_fd_ >= 0) {
+            close(uart_fd_);
+        }
+    }
+    
+    bool init_uart() {
+        uart_fd_ = open(uart_device_.c_str(), O_RDWR | O_NOCTTY | O_NDELAY);
+        if (uart_fd_ < 0) {
+            std::cerr << "Cannot open UART device: " << uart_device_ << ", error: " << strerror(errno) << std::endl;
+            return false;
+        }
+        
+        struct termios options;
+        tcgetattr(uart_fd_, &options);
+        
+        cfsetispeed(&options, baud_rate);
+        cfsetospeed(&options, baud_rate);
+        
+        options.c_cflag &= ~PARENB;
+        options.c_cflag &= ~CSTOPB;
+        options.c_cflag &= ~CSIZE;
+        options.c_cflag |= CS8;
+        
+        options.c_cflag |= (CLOCAL | CREAD);
+        
+        options.c_iflag &= ~(IXON | IXOFF | IXANY);
+        
+        options.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
+        
+        options.c_oflag &= ~OPOST;
+        
+        options.c_cc[VMIN] = 0;
+        options.c_cc[VTIME] = 1;
+        
+        tcsetattr(uart_fd_, TCSANOW, &options);
+        
+        tcflush(uart_fd_, TCIOFLUSH);
+        
+        std::cout << "UART initialized: " << uart_device_ << " @ 9600 baud" << std::endl;
+        return true;
+    }
+    
+    // 设置波特率
+    bool set_baud_rate(speed_t baud) {
+        if (uart_fd_ < 0) {
+            std::cerr << "UART not initialized" << std::endl;
+            return false;
+        }
+        
+        struct termios options;
+        if (tcgetattr(uart_fd_, &options) != 0) {
+            std::cerr << "Failed to get UART attributes" << std::endl;
+            return false;
+        }
+        
+        if (cfsetispeed(&options, baud) != 0 || cfsetospeed(&options, baud) != 0) {
+            std::cerr << "Failed to set UART baud rate" << std::endl;
+            return false;
+        }
+        
+        if (tcsetattr(uart_fd_, TCSANOW, &options) != 0) {
+            std::cerr << "Failed to apply UART settings" << std::endl;
+            return false;
+        }
+        
+        return true;
+    }
+    
+    bool send_command(uint8_t* data, size_t length) {
+        if (uart_fd_ < 0) {
+            std::cerr << "UART not initialized" << std::endl;
+            return false;
+        }
+        
+        ssize_t bytes_written = write(uart_fd_, data, length);
+        if (bytes_written < 0) {
+            std::cerr << "Failed to write to UART" << std::endl;
+            return false;
+        }
+        
+        if ((size_t)bytes_written != length) {
+            std::cerr << "Partial write: " << bytes_written << "/" << length << " bytes" << std::endl;
+            return false;
+        }
+        
+        return true;
+    }
+    
+
+    
+    void move_servo(uint8_t servo_id, uint16_t position, uint16_t time) {
+        if (servo_id > 31 || time == 0) {
+            std::cerr << "Invalid servo parameters: ID=" << (unsigned int)servo_id << ", Time=" << time << std::endl;
+            return;
+        }
+        
+        // 清空接收缓冲区
+        tcflush(uart_fd_, TCIFLUSH);
+        
+        tx_buf_[0] = tx_buf_[1] = FRAME_HEADER;
+        tx_buf_[2] = 8;
+        tx_buf_[3] = CMD_SERVO_MOVE;
+        tx_buf_[4] = 1;
+        tx_buf_[5] = GET_LOW_BYTE(time);
+        tx_buf_[6] = GET_HIGH_BYTE(time);
+        tx_buf_[7] = servo_id;
+        tx_buf_[8] = GET_LOW_BYTE(position);
+        tx_buf_[9] = GET_HIGH_BYTE(position);
+        
+        std::cout << "Sending servo command: ID=" << (unsigned int)servo_id << ", Position=" << position << ", Time=" << time << std::endl;
+        
+        bool result = send_command(tx_buf_, 10);
+        
+        if (result) {
+            std::cout << "Servo " << (unsigned int)servo_id << " moved to position " << position << " in " << time << " ms" << std::endl;
+        }
+    }
+};
+
+// 主节点类
+class EyesControlNode : public rclcpp::Node {
+public:
+    EyesControlNode() : Node("eyes_control_node") {
+        // 初始化舵机控制器
+        servo_ctrl_ = std::make_unique<ServoController>("/dev/ttyS7");
+        
+        // 初始化舵机到中心位置
+        servo_ctrl_->move_servo(SERVO_RIGHT_EYE_YAW, SERVO_YAW_CENTER, MOVE_TIME);
+        servo_ctrl_->move_servo(SERVO_LEFT_EYE_YAW, SERVO_YAW_CENTER, MOVE_TIME);
+        servo_ctrl_->move_servo(SERVO_BOTH_EYES_PITCH, SERVO_PITCH_CENTER, MOVE_TIME);
+        
+        // 订阅人脸角度话题
+        angle_subscription_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
+            "face/angle",
+            10,
+            std::bind(&EyesControlNode::angle_callback, this, std::placeholders::_1)
+        );
+        
+        RCLCPP_INFO(this->get_logger(), "Eyes Control Node started successfully");
+        RCLCPP_INFO(this->get_logger(), "Subscribed to face/angle topic");
+        RCLCPP_INFO(this->get_logger(), "Servos initialized to center position");
+        RCLCPP_INFO(this->get_logger(), "Right eye yaw servo: ID=%d, Center=%d", SERVO_RIGHT_EYE_YAW, SERVO_YAW_CENTER);
+        RCLCPP_INFO(this->get_logger(), "Left eye yaw servo: ID=%d, Center=%d", SERVO_LEFT_EYE_YAW, SERVO_YAW_CENTER);
+        RCLCPP_INFO(this->get_logger(), "Both eyes pitch servo: ID=%d, Center=%d", SERVO_BOTH_EYES_PITCH, SERVO_PITCH_CENTER);
+    }
+    
+    ~EyesControlNode() {
+        // 析构函数
+    }
+    
+private:
+    // 角度回调函数
+    void angle_callback(const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
+        if (msg->data.size() >= 2) {
+            double raw_angle_yaw = msg->data[0];   // 原始偏航角 (水平)
+            double angle_pitch = msg->data[1];      // 俯仰角 (垂直)
+            double angle_yaw = -raw_angle_yaw;      // 反转偏航角以纠正镜像问题
+            
+            RCLCPP_INFO(this->get_logger(), "Received angles: Raw Yaw=%.2f, Corrected Yaw=%.2f, Pitch=%.2f", raw_angle_yaw, angle_yaw, angle_pitch);
+            
+            // 计算舵机位置
+            uint16_t yaw_position = calculate_servo_position(angle_yaw, SERVO_YAW_CENTER);
+            uint16_t pitch_position = calculate_servo_position(angle_pitch, SERVO_PITCH_CENTER);
+            
+            // 控制舵机
+            servo_ctrl_->move_servo(SERVO_RIGHT_EYE_YAW, yaw_position, MOVE_TIME);
+            servo_ctrl_->move_servo(SERVO_LEFT_EYE_YAW, yaw_position, MOVE_TIME);
+            servo_ctrl_->move_servo(SERVO_BOTH_EYES_PITCH, pitch_position, MOVE_TIME);
+            
+            RCLCPP_INFO(this->get_logger(), "Controlled servos: Yaw=%d, Pitch=%d", yaw_position, pitch_position);
+        }
+    }
+    
+    // 计算舵机位置
+    uint16_t calculate_servo_position(double angle, uint16_t center_pos) {
+        // 将角度映射到舵机位置范围
+        // 角度范围: -ANGLE_RANGE/2 到 ANGLE_RANGE/2
+        // 位置范围: SERVO_MIN_POS 到 SERVO_MAX_POS
+        
+        // 归一化角度到 0-1 范围
+        double normalized_angle = (angle + ANGLE_RANGE/2) / ANGLE_RANGE;
+        
+        // 限制范围
+        if (normalized_angle < 0.0) normalized_angle = 0.0;
+        if (normalized_angle > 1.0) normalized_angle = 1.0;
+        
+        // 映射到舵机位置
+        uint16_t position = SERVO_MIN_POS + (SERVO_MAX_POS - SERVO_MIN_POS) * normalized_angle;
+        
+        // 应用左右转动限位（仅适用于偏航角舵机）
+        if (center_pos == SERVO_YAW_CENTER) {
+            uint16_t min_limit = SERVO_YAW_CENTER - SERVO_YAW_LIMIT;
+            uint16_t max_limit = SERVO_YAW_CENTER + SERVO_YAW_LIMIT;
+            
+            if (position < min_limit) position = min_limit;
+            if (position > max_limit) position = max_limit;
+        }
+        
+        // 应用上下转动限位（仅适用于俯仰角舵机）
+        if (center_pos == SERVO_PITCH_CENTER) {
+            uint16_t min_limit = SERVO_PITCH_CENTER - SERVO_PITCH_LIMIT;
+            uint16_t max_limit = SERVO_PITCH_CENTER + SERVO_PITCH_LIMIT;
+            
+            if (position < min_limit) position = min_limit;
+            if (position > max_limit) position = max_limit;
+        }
+        
+        return position;
+    }
+    
+    // 成员变量
+    std::unique_ptr<ServoController> servo_ctrl_;
+    rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr angle_subscription_;
+};
+
+int main(int argc, char** argv) {
+    // 初始化ROS2
+    rclcpp::init(argc, argv);
+    
+    // 创建节点
+    auto node = std::make_shared<EyesControlNode>();
+    
+    // 运行节点
+    rclcpp::spin(node);
+    
+    // 关闭ROS2
+    rclcpp::shutdown();
+    
+    return 0;
+}

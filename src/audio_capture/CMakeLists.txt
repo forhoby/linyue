@@ -29,7 +29,6 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 add_executable(video src/video.cpp)
 add_executable(video2 src/video2.cpp)
 add_executable(show src/show.cpp)
-add_executable(angle_node src/angle.cpp)
 add_executable(audio_recorder src/record.cpp)
 add_executable(audio_player src/play.cpp)
 
@@ -56,15 +55,6 @@ ament_target_dependencies(show
   sensor_msgs
   cv_bridge
   std_msgs
-)
-
-ament_target_dependencies(angle_node
-  rclcpp
-  geometry_msgs
-)
-
-target_link_libraries(angle_node
-  wiringPi
 )
 
 ament_target_dependencies(audio_recorder
@@ -110,7 +100,7 @@ install(TARGETS
   
   video2
   show
-  angle_node
+  
   audio_recorder
   audio_player
   DESTINATION lib/${PROJECT_NAME})

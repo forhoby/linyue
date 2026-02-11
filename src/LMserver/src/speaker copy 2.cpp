@@ -2,7 +2,6 @@
 #include "std_msgs/msg/int16_multi_array.hpp"
 #include "std_msgs/msg/int32_multi_array.hpp"
 #include <alsa/asoundlib.h>
-#include <alsa/pcm.h>
 #include <vector>
 #include <chrono>
 #include <thread>
@@ -10,10 +9,6 @@
 #include <complex>
 #include <valarray>
 #include <deque>
-#include <queue>
-#include <mutex>
-#include <condition_variable>
-#include <atomic>
 
 // 宏定义：选择音频设备
 // 可选值：
@@ -24,9 +19,9 @@
 
 // 音频处理参数
 #define CHUNK_SIZE 1323             // 每次处理的音频帧大小（60ms @ 22050Hz）
-#define SMOOTHING_JAW 0.4           // 舵机平滑系数
-#define SMOOTHING_CORNER 0.4        // 舵机平滑系数
-#define delayTime_MS 53
+#define SMOOTHING_JAW 0.6           // 舵机平滑系数
+#define SMOOTHING_CORNER 0.6        // 舵机平滑系数
+
 // 自适应参数设置
 #define ADAPTIVE_WINDOW_SIZE 150    // 用于统计的历史帧数
 #define ADAPTIVE_UPDATE_INTERVAL 30 // 每N帧更新一次参数
@@ -34,10 +29,10 @@
 // 舵机参数设置
 #define SERVO_JAW_MIN 1300           // 嘴部张合最小参数（闭合）
 #define SERVO_JAW_MAX 1600           // 嘴部张合最大参数（张开）
-#define SERVO_LEFT_MIN 2000           // 左嘴角最小参数（内聚）
-#define SERVO_LEFT_MAX 1200          // 左嘴角最大参数（外展）
-#define SERVO_RIGHT_MIN 1900          // 右嘴角最小参数（外展）
-#define SERVO_RIGHT_MAX 1200        // 右嘴角最大参数（内收）
+#define SERVO_LEFT_MIN 1300           // 左嘴角最小参数（内聚）
+#define SERVO_LEFT_MAX 1800          // 左嘴角最大参数（外展）
+#define SERVO_RIGHT_MIN 1700          // 右嘴角最小参数（外展）
+#define SERVO_RIGHT_MAX 1300        // 右嘴角最大参数（内收）
 
 // 舵机索引
 #define SERVO_JAW_INDEX 10          // 嘴部张合舵机索引
@@ -119,13 +114,6 @@ private:
     
     // 音频缓冲区
     std::vector<int16_t> audio_buffer_;
-    // 音频数据队列
-    std::queue<std::vector<int16_t>> audio_queue_;
-    std::mutex queue_mutex_;
-    std::condition_variable queue_cv_;
-    std::atomic<bool> stop_processing_;
-    std::thread processing_thread_;
-    
     // 记录状态
     bool is_recording_;
     // 时间跟踪
@@ -164,8 +152,7 @@ public:
                     min_freq_(400.0), 
                     max_freq_(4000.0), 
                     current_jaw_(0.0), 
-                    current_width_(0.5),
-                    stop_processing_(false) {
+                    current_width_(0.5) {
         // 初始化 ALSA
         init_alsa();
         
@@ -185,22 +172,12 @@ public:
 
         // 初始化频率轴
         init_freq_axis();
-        
-        // 启动音频处理线程
-        processing_thread_ = std::thread(&SpeakerNode::audio_processing_loop, this);
 
         RCLCPP_INFO(this->get_logger(), "Speaker node started, listening to /robot/audio_reply");
         RCLCPP_INFO(this->get_logger(), "Servo control publisher initialized, publishing to /robot/servo_angles");
     }
 
     ~SpeakerNode() {
-        // 停止处理线程
-        stop_processing_ = true;
-        queue_cv_.notify_all();
-        if (processing_thread_.joinable()) {
-            processing_thread_.join();
-        }
-        
         // 关闭音频设备
         if (pcm_handle_) {
             snd_pcm_drain(pcm_handle_);
@@ -212,80 +189,6 @@ private:
     void init_alsa() {
         // 初始化音频设备（使用宏定义的设备）
         init_alsa_device(&pcm_handle_, AUDIO_DEVICE, "Audio Device");
-    }
-    
-    void audio_processing_loop() {
-        while (!stop_processing_) {
-            std::vector<int16_t> audio_data;
-            
-            {
-                std::unique_lock<std::mutex> lock(queue_mutex_);
-                queue_cv_.wait(lock, [this] { 
-                    return !audio_queue_.empty() || stop_processing_; 
-                });
-                
-                if (stop_processing_) {
-                    break;
-                }
-                
-                audio_data = audio_queue_.front();
-                audio_queue_.pop();
-            }
-            
-            // 处理音频数据
-            process_audio_data(audio_data);
-        }
-    }
-    
-    void process_audio_data(const std::vector<int16_t>& audio_data) {
-        if (audio_data.empty()) {
-            return;
-        }
-        
-        // 将音频数据切分为60ms的数据包
-        size_t offset = 0;
-        size_t chunk_size = CHUNK_SIZE;
-        
-        while (offset < audio_data.size()) {
-            size_t current_chunk = std::min(chunk_size, audio_data.size() - offset);
-            std::vector<int16_t> chunk_data(audio_data.begin() + offset, audio_data.begin() + offset + current_chunk);
-            
-            // 处理音频数据包
-            process_audio_chunk(chunk_data);
-            
-            // 播放音频数据包
-            play_audio_chunk(chunk_data);
-            
-            // 等待50ms再处理下一个数据包
-            std::this_thread::sleep_for(std::chrono::milliseconds(delayTime_MS));
-            
-            offset += current_chunk;
-        }
-    }
-    
-    void play_audio_chunk(const std::vector<int16_t>& audio_chunk) {
-        if (!pcm_handle_ || audio_chunk.empty()) {
-            return;
-        }
-        
-        size_t frames = audio_chunk.size();
-        if (channels_ == 2) {
-            frames = audio_chunk.size() / 2;
-        }
-        
-        snd_pcm_sframes_t frames_written = snd_pcm_writei(
-            pcm_handle_, 
-            audio_chunk.data(), 
-            frames
-        );
-        
-        if (frames_written < 0) {
-            RCLCPP_WARN(this->get_logger(), "Error writing to audio device: %s, trying to recover", snd_strerror(frames_written));
-            frames_written = snd_pcm_recover(pcm_handle_, frames_written, 0);
-            if (frames_written < 0) {
-                RCLCPP_ERROR(this->get_logger(), "Failed to recover audio device: %s", snd_strerror(frames_written));
-            }
-        }
     }
     
     void init_freq_axis() {
@@ -393,7 +296,7 @@ private:
         if (rms > noise_gate_) {
             // 计算嘴巴张合程度
             target_jaw = std::clamp((rms - noise_gate_) / (max_rms_ - noise_gate_), 0.0, 1.0);
-            target_jaw = std::pow(target_jaw, 0.5); // 稍微放大一点小信号
+            target_jaw = std::pow(target_jaw, 0.7); // 稍微放大一点小信号
             
             // 计算嘴巴宽度
             // 高频(>1500Hz)通常对应 'i', 'e' (嘴角拉开)
@@ -424,21 +327,12 @@ private:
         int left_param = SERVO_LEFT_MIN + static_cast<int>((SERVO_LEFT_MAX - SERVO_LEFT_MIN) * current_width_);
         int right_param = SERVO_RIGHT_MAX - static_cast<int>((SERVO_RIGHT_MAX - SERVO_RIGHT_MIN) * current_width_);
         
-        // 计算相对基点的差值
-        const int BASE_JAW = 1300;
-        const int BASE_LEFT = 1500;
-        const int BASE_RIGHT = 1500;
-        
-        int jaw_diff = jaw_param - BASE_JAW;
-        int left_diff = left_param - BASE_LEFT;
-        int right_diff = right_param - BASE_RIGHT;
-        
-        // 发布舵机参数（相对差值）
+        // 发布舵机参数
         auto msg = std::make_unique<std_msgs::msg::Int32MultiArray>();
         msg->data.resize(3);
-        msg->data[0] = jaw_diff;
-        msg->data[1] = left_diff;
-        msg->data[2] = right_diff;
+        msg->data[0] = jaw_param;
+        msg->data[1] = left_param;
+        msg->data[2] = right_param;
         
         servo_publisher_->publish(std::move(msg));
         
@@ -448,7 +342,112 @@ private:
 
     // 检查录制超时
     void check_recording_timeout() {
-        // 不再需要这个方法，因为使用队列方式处理音频数据
+        if (is_recording_) {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - last_callback_time_).count();
+            
+            if (elapsed >= 200) {
+                // 超过200ms无数据，结束录制并播放
+                finish_recording();
+            }
+        }
+    }
+
+    // 结束录制并播放音频
+    void finish_recording() {
+        if (is_recording_ && !audio_buffer_.empty()) {
+            is_recording_ = false;
+            
+            RCLCPP_INFO(this->get_logger(), "Recording finished, playing buffered audio...");
+            RCLCPP_INFO(this->get_logger(), "Buffer size: %zu samples", audio_buffer_.size());
+            
+            // 播放缓冲的音频
+            if (pcm_handle_) {
+                // 分块播放音频数据，每次播放合适的大小
+                size_t total_samples = audio_buffer_.size();
+                size_t offset = 0;
+                size_t chunk_size = 1323; // 每次播放 1323 个样本（60ms @ 22050Hz）
+                size_t total_played = 0;
+                bool device_error = false;
+                
+                // 确保设备处于准备状态
+                int err = snd_pcm_prepare(pcm_handle_);
+                if (err < 0) {
+                    RCLCPP_ERROR(this->get_logger(), "Failed to prepare audio device: %s", snd_strerror(err));
+                    device_error = true;
+                }
+                
+                if (!device_error) {
+                    while (offset < total_samples && !device_error) {
+                        // 计算当前块的大小
+                        size_t current_chunk = std::min(chunk_size, total_samples - offset);
+                        
+                        // 计算帧数（考虑声道数）
+                        size_t frames = current_chunk;
+                        if (channels_ == 2) {
+                            // 立体声时，帧数是样本数的一半
+                            frames = current_chunk / 2;
+                        }
+                        
+                        // 提取当前块的音频数据用于处理
+                        std::vector<int16_t> chunk_data(audio_buffer_.begin() + offset, audio_buffer_.begin() + offset + current_chunk);
+                        
+                        // 先处理音频数据，计算RMS和频谱质心，并控制舵机
+                        process_audio_chunk(chunk_data);
+                        
+                        // 非阻塞式播放当前块
+                        snd_pcm_sframes_t frames_written = snd_pcm_writei(
+                            pcm_handle_, 
+                            audio_buffer_.data() + offset, 
+                            frames
+                        );
+
+                        if (frames_written < 0) {
+                            // 处理错误
+                            RCLCPP_WARN(this->get_logger(), "Error writing to audio device: %s, trying to recover", snd_strerror(frames_written));
+                            frames_written = snd_pcm_recover(pcm_handle_, frames_written, 0);
+                            if (frames_written < 0) {
+                                RCLCPP_ERROR(this->get_logger(), "Failed to recover audio device: %s", snd_strerror(frames_written));
+                                device_error = true;
+                                break;
+                            }
+                        } else {
+                            // 计算实际播放的样本数
+                            size_t played_samples = frames_written;
+                            if (channels_ == 2) {
+                                played_samples = frames_written * 2;
+                            }
+                            
+                            // 更新已播放的样本数和偏移量
+                            total_played += played_samples;
+                            offset += played_samples;
+                            
+                            RCLCPP_DEBUG(this->get_logger(), "Played chunk: %zu frames, %zu samples, total played: %zu samples", frames_written, played_samples, total_played);
+                        }
+                        
+                        
+                    }
+                    
+                    // 所有音频块播放完成后，阻塞等待剩余数据播放完成
+                    int drain_err = snd_pcm_drain(pcm_handle_);
+                    if (drain_err < 0) {
+                        RCLCPP_WARN(this->get_logger(), "Error draining audio device: %s", snd_strerror(drain_err));
+                    }
+                }
+                
+                if (total_played > 0) {
+                    RCLCPP_INFO(this->get_logger(), "Played %zu samples total", total_played);
+                }
+                
+                if (device_error) {
+                    RCLCPP_ERROR(this->get_logger(), "Audio device error occurred during playback");
+                }
+            }
+            
+            // 清空缓冲区
+            audio_buffer_.clear();
+        }
     }
 
     void init_alsa_device(snd_pcm_t **pcm_handle, const char *device, const char *device_name) {
@@ -556,21 +555,10 @@ private:
                     // 打断当前播放（通过 drain 操作）
                     if (pcm_handle_) {
                         snd_pcm_drain(pcm_handle_);
-                        // 恢复设备到准备状态
-                        int err = snd_pcm_prepare(pcm_handle_);
-                        if (err < 0) {
-                            RCLCPP_ERROR(this->get_logger(), "Failed to prepare audio device after drain: %s", snd_strerror(err));
-                        }
                     }
                     
-                    // 清空队列
-                    {
-                        std::lock_guard<std::mutex> lock(queue_mutex_);
-                        while (!audio_queue_.empty()) {
-                            audio_queue_.pop();
-                        }
-                    }
-                    
+                    // 清空缓冲
+                    audio_buffer_.clear();
                     is_recording_ = false;
                 }
             }
@@ -580,20 +568,16 @@ private:
                 is_recording_ = true;
                 start_time_ = now;
                 last_callback_time_ = now;
+                audio_buffer_.clear();
                 RCLCPP_INFO(this->get_logger(), "Started recording new audio segment");
             } else {
                 // 更新最后回调时间
                 last_callback_time_ = now;
             }
 
-            // 将音频数据放入队列
-            {
-                std::lock_guard<std::mutex> lock(queue_mutex_);
-                audio_queue_.push(audio_data);
-            }
-            queue_cv_.notify_one();
-            
-            RCLCPP_DEBUG(this->get_logger(), "Added %zu samples to queue, queue size: %zu", data_size, audio_queue_.size());
+            // 将音频数据添加到缓冲区
+            audio_buffer_.insert(audio_buffer_.end(), audio_data.begin(), audio_data.end());
+            RCLCPP_DEBUG(this->get_logger(), "Added %zu samples to buffer, total buffer size: %zu", data_size, audio_buffer_.size());
 
         } catch (const std::exception &e) {
             RCLCPP_ERROR(this->get_logger(), "Error in audio callback: %s", e.what());

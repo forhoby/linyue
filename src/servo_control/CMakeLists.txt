@@ -19,10 +19,41 @@ ament_target_dependencies(eyes_ctrl
   geometry_msgs
 )
 
+
+
+# 构建可执行文件
+add_executable(mouth_ctrl src/mouth_ctrl.cpp)
+
+# 添加依赖
+ament_target_dependencies(mouth_ctrl
+  rclcpp
+  geometry_msgs
+)
+
+
+
+
+# 添加依赖
+ament_target_dependencies(mouth_ctrl
+  rclcpp
+  geometry_msgs
+)
+
+
 # 安装可执行文件
 install(TARGETS eyes_ctrl
   DESTINATION lib/${PROJECT_NAME}
 )
+
+# 安装可执行文件
+install(TARGETS mouth_ctrl
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(DIRECTORY launch
+  DESTINATION share/${PROJECT_NAME}
+)
+
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)

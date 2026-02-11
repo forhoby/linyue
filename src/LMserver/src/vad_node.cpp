@@ -13,7 +13,7 @@ class VadServerNode : public rclcpp::Node {
 public:
     VadServerNode() : Node("vad_node") {
         // ==================== 参数声明 ====================
-        this->declare_parameter<int>("vad_aggressiveness", 1);  // 0-3 (0: 最不敏感, 3: 最敏感)
+        this->declare_parameter<int>("vad_aggressiveness", 0);  // 0-3 (0: 最不敏感, 3: 最敏感)
         this->declare_parameter<int>("vad_frame_duration_ms", 30);  // 10, 20, 或 30
         this->declare_parameter<double>("silence_threshold", 0.4);  // 静音阈值（语音比例）
         this->declare_parameter<double>("min_speech_ratio", 0.4);  // 最小人声占比（判断本次录音是否有人说话）

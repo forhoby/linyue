@@ -2,7 +2,7 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-from std_msgs.msg import Int16MultiArray, String
+from std_msgs.msg import UInt8MultiArray, Int16MultiArray, String
 from audio_capture.msg import AudioData
 from cv_bridge import CvBridge
 import cv2
@@ -51,13 +51,6 @@ class ROSOmniCallback(OmniRealtimeCallback):
                 # Bytes -> Numpy Int16
                 audio_np = np.frombuffer(audio_bytes, dtype=np.int16)
                 
-                # 计算音频包时长
-                # 音频格式：16kHz, 16bit, mono
-                # 时长(秒) = 字节数 / (采样率 * 声道数 * 位深度/8)
-                # 16000 * 1 * 2 = 32000 字节/秒
-                audio_duration = len(audio_bytes) / 32000.0
-                self.node.get_logger().info(f"Audio packet duration: {audio_duration:.4f} seconds")
-                
                 # 发布到 /robot/audio_reply
                 msg = Int16MultiArray()
                 msg.data = audio_np.tolist()
@@ -67,7 +60,7 @@ class ROSOmniCallback(OmniRealtimeCallback):
             elif 'response.audio_transcript.delta' == event_type:
                 text = response['delta']
                 self.node.get_logger().info(f"AI: {text}") 
-            
+
             # 3. 识别用户说的话
             elif 'conversation.item.input_audio_transcription.completed' == event_type:
                 self.node.get_logger().info(f"🗣️ User said: {response['transcript']}")
@@ -84,58 +77,6 @@ class ROSOmniCallback(OmniRealtimeCallback):
 
         except Exception as e:
             self.node.get_logger().error(f'Callback Error: {e}')
-
-class ROSOmniExpressionCallback(OmniRealtimeCallback):
-    """
-    重写回调类，仅处理表情输出
-    """
-    def __init__(self, node_instance):
-        self.node = node_instance
-
-    def on_open(self) -> None:
-        self.node.get_logger().info('✅ DashScope Expression Connection opened!')
-
-    def on_close(self, close_status_code, close_msg) -> None:
-        self.node.get_logger().warn(f'⚠️ DashScope Expression Connection closed: {close_msg}')
-        # 更新连接状态为已关闭
-        self.node.omni_expression_connected = False
-
-    def on_event(self, response: str) -> None:
-        try:
-            event_type = response.get('type','unknown')
-            print(f">>>[DEBUG] Expression Model Recieved Event:{event_type}", flush=True)
-
-            if event_type=='error':
-                self.node.get_logger().error(f"EXPRESSION SERVER ERROR:{response}")
-                # 遇到错误时，更新连接状态为已关闭
-                self.node.omni_expression_connected = False
-            
-            # 处理表情相关的事件
-            # 这里需要根据实际的表情输出事件类型进行调整
-            # 假设表情输出事件类型为 'response.expression.delta'
-            elif 'response.text.delta' == event_type:
-                expression_data = response.get('delta', {})
-                self.node.get_logger().info(f"[[[response.text.delta Emotion AI]]]: {expression_data}")
-                
-                # # 发布情绪数据
-                # emotion_msg = String()
-                # emotion_msg.data = expression_data
-                # self.node.pub_emotion.publish(emotion_msg)
-            
-            # 处理完整的表情回复
-            #elif 'response.text.completed' == event_type:
-            elif 'response.text.done' == event_type:
-                expression_data = response.get('text', {})
-                if expression_data:
-                    self.node.get_logger().info(f"[[[response.text.done Emotion AI]]] (completed): {expression_data}")
-                    
-                    # 发布情绪数据
-                    emotion_msg = String()
-                    emotion_msg.data = expression_data
-                    self.node.pub_emotion.publish(emotion_msg)
-
-        except Exception as e:
-            self.node.get_logger().error(f"Error in expression callback: {e}")
 
 
 class OmniBrainNode(Node):
@@ -166,7 +107,6 @@ class OmniBrainNode(Node):
         
         # 连接状态标志
         self.omni_connected = False
-        self.omni_expression_connected = False
         
         # 音频发送状态标志
         self.audio_sent = False
@@ -197,13 +137,6 @@ class OmniBrainNode(Node):
         self.pub_audio_reply = self.create_publisher(
             Int16MultiArray, 
             '/robot/audio_reply', 
-            10
-        )
-        
-        # [情绪] 发布情绪数据
-        self.pub_emotion = self.create_publisher(
-            String, 
-            '/robot/emotion', 
             10
         )
         
@@ -257,55 +190,9 @@ class OmniBrainNode(Node):
             )
             self.get_logger().info("DashScope Session Initialized.")
             
-            # --- 连接第二个只输出表情的模型 --- 
-            self.get_logger().info("Connecting to expression-only model...")
-            expression_callback = ROSOmniExpressionCallback(self)
-            
-            self.expression_conversation = OmniRealtimeConversation(
-                model='qwen3-omni-flash-realtime',
-                callback=expression_callback, 
-            )
-
-            # 连接到 DashScope
-            self.get_logger().info("Attempting to connect to DashScope for expression model...")
-            expression_connect_result = self.expression_conversation.connect()
-            self.get_logger().info(f"Expression model Connect() returned: {expression_connect_result}")
-            
-            # 检查连接状态
-            expression_connection_status = getattr(self.expression_conversation, 'connected', None)
-            if expression_connection_status is None:
-                self.get_logger().warn("Expression model connection status attribute not found, using alternative check")
-                # 由于无法直接获取连接状态，我们假设连接成功，后续会通过错误处理来更新状态
-                self.omni_expression_connected = True
-            elif expression_connection_status:
-                self.get_logger().info("✅ Expression model WebSocket connection established successfully")
-                self.omni_expression_connected = True
-            else:
-                self.get_logger().error("❌ Expression model WebSocket connection failed")
-                self.omni_expression_connected = False
-            
-            # 等待连接完全建立
-            self.get_logger().info("Waiting for expression model connection to fully establish...")
-            time.sleep(2.0)
-            self.get_logger().info("Expression model connection setup completed")
-            # 配置 Session 参数，只输出表情
-            self.expression_conversation.update_session(
-                output_modalities=[MultiModality.TEXT],
-                voice=self.voice,
-                input_audio_format=AudioFormat.PCM_16000HZ_MONO_16BIT,
-                output_audio_format=AudioFormat.PCM_16000HZ_MONO_16BIT,
-                enable_input_audio_transcription=True,
-                input_audio_transcription_model='gummy-realtime-v1',
-                enable_turn_detection=True,
-                turn_detection_type='server_vad',
-                instructions="你是一个只会回答“happy”、“sad”、“nature”、“amazing”的机器，请感受用户的话语和语气，并返回你听到后你自己的情绪，从“happy”、“sad”、“nature”、“amazing”中选择一个。"
-            )
-            self.get_logger().info("DashScope Expression Session Initialized.")
-            
         except Exception as e:
             self.get_logger().error(f"Failed to connect to DashScope: {e}")
             self.omni_connected = False
-            self.omni_expression_connected = False
             # sys.exit(1) # 建议不要直接退出，可能网络波动，保留节点等待重连逻辑(如需)
 
     def audio_input_callback(self, msg: AudioData):
@@ -315,7 +202,7 @@ class OmniBrainNode(Node):
         """
         try:
             # 检查连接状态
-            if not self.omni_connected or not self.omni_expression_connected:
+            if not self.omni_connected:
                 self.get_logger().warn("Omni connection not established, skipping audio send. Attempting to reconnect...")
                 self.init_omni_connection()
                 return
@@ -349,12 +236,7 @@ class OmniBrainNode(Node):
                 
                 # 发送给 DashScope
                 try:
-                    # 发送给第一个模型（音频+文本输出）
                     self.conversation.append_audio(audio_b64)
-                    
-                    # 发送给第二个模型（仅表情输出）
-                    if self.omni_expression_connected:
-                        self.expression_conversation.append_audio(audio_b64)
                     
                     # [重要流控] 
                     # 稍微 sleep 一下，模拟实时流的速度，防止瞬间将大块数据塞入 WebSocket 导致拥塞
@@ -365,7 +247,6 @@ class OmniBrainNode(Node):
                     # 如果是连接关闭错误，更新连接状态
                     if "Connection is already closed" in str(append_error):
                         self.omni_connected = False
-                        self.omni_expression_connected = False
                         self.get_logger().warn("Connection closed, will attempt to reconnect on next audio input")
                     break
 
@@ -390,10 +271,6 @@ class OmniBrainNode(Node):
                         
                         # 发送给 DashScope
                         self.conversation.append_video(img_b64)
-                        
-                        # 发送给第二个模型（仅表情输出）
-                        if self.omni_expression_connected:
-                            self.expression_conversation.append_video(img_b64)
                         
                         # 计算一下大小，方便观察
                         size_kb = len(img_b64) / 1024.0
