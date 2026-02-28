@@ -78,6 +78,8 @@ class ROSOmniCallback(OmniRealtimeCallback):
             
             # 4. 打断信号 (VAD检测到用户说话)
             elif 'input_audio_buffer.speech_started' == event_type:
+                self.node.audio_sent = False
+
                 self.node.get_logger().info('🛑 User Speech Started (Interrupt)')
                 # 这里可以发布一个空消息或者特定指令给播放节点，让它立即停止播放
                 # self.node.pub_interrupt.publish(...) 

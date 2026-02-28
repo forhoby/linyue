@@ -73,7 +73,7 @@ typedef struct {
 #define SERVO_YAW_LIMIT 300       // 左右转动限位（中心位置±300）
 #define SERVO_PITCH_LIMIT 300     // 上下转动限位（中心位置±300）
 #define ANGLE_RANGE 60.0          // 角度范围（度）
-#define MOVE_TIME 200             // 舵机移动时间（毫秒）
+#define MOVE_TIME 400             // 舵机移动时间（毫秒）
 
 // 小端序字节转单精度浮点数
 float bytes_to_float_little_endian(unsigned char byte0, unsigned char byte1, unsigned char byte2, unsigned char byte3) {
@@ -701,8 +701,8 @@ private:
         
         // 计算语音同步的目标位置
         int speech_jaw = BASE_JAW + jaw_diff_*1.5;
-        int speech_left = BASE_LEFT + left_diff_*1.5;
-        int speech_right = BASE_RIGHT + right_diff_;
+        int speech_left = BASE_LEFT + left_diff_*4;
+        int speech_right = BASE_RIGHT + right_diff_*4;
         
         // 计算表情的目标位置
         int expression_jaw = expression_jaw_target_;
@@ -724,17 +724,30 @@ private:
                     speech_jaw, speech_left, speech_right, 
                     expression_jaw, expression_left, expression_right);
         
-        // 控制嘴部舵机
-        LobotServo servos[3];
-        servos[0].ID = 10; // 嘴部张合舵机
-        servos[0].Position = static_cast<uint16_t>(jaw_position);
-        servos[1].ID = 9; // 左嘴角舵机
-        servos[1].Position = static_cast<uint16_t>(left_position);
-        servos[2].ID = 8; // 右嘴角舵机
-        servos[2].Position = static_cast<uint16_t>(right_position);
+        // 单独控制嘴部张合舵机（每次都控制）
+        servo_ctrl_->move_servo(10, static_cast<uint16_t>(jaw_position), 50); // 嘴部张合舵机
         
-        // 同时控制多个舵机
-        servo_ctrl_->move_servos_by_array(servos, 3, MOVE_TIME);
+        // 检查嘴角舵机控制的冷却时间（0.8秒）
+        auto now = std::chrono::steady_clock::now();
+        auto corner_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - last_corner_control_time_).count();
+        
+        if (corner_elapsed >= 200 || last_corner_control_time_ == std::chrono::steady_clock::time_point()) {
+            // 同时控制左右嘴角舵机（达到冷却时间才控制）
+            LobotServo corner_servos[2];
+            corner_servos[0].ID = 9; // 左嘴角舵机
+            corner_servos[0].Position = static_cast<uint16_t>(left_position);
+            corner_servos[1].ID = 8; // 右嘴角舵机
+            corner_servos[1].Position = static_cast<uint16_t>(right_position);
+            
+            servo_ctrl_->move_servos_by_array(corner_servos, 2, 200);
+            
+            // 更新嘴角舵机控制时间
+            last_corner_control_time_ = now;
+            RCLCPP_INFO(this->get_logger(), "控制嘴角舵机，冷却时间已过 %ld 毫秒", corner_elapsed);
+        } else {
+            RCLCPP_INFO(this->get_logger(), "嘴角舵机冷却时间未到，跳过控制，已过 %ld 毫秒", corner_elapsed);
+        }
     }
     
     
@@ -911,6 +924,11 @@ private:
     // 权重参数
     float speech_weight_ = 0.7;  // 语音同步权重
     float expression_weight_ = 0.3;  // 表情权重
+    
+    // 上次执行嘴部舵机控制的时间
+    std::chrono::steady_clock::time_point last_mouth_control_time_;
+    // 上次执行嘴角舵机控制的时间
+    std::chrono::steady_clock::time_point last_corner_control_time_;
 };
 
 int main(int argc, char** argv) {
